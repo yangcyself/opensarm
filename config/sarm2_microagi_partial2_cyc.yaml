@@ -1,0 +1,154 @@
+_target_: workspace.sarm2_ws.SARM2Workspace
+
+hydra:
+  run:
+    dir: outputs/${cfg.general.project_name}/${cfg.general.task_name}/${now:%Y-%m-%d_%H-%M-%S}
+
+cfg:
+  general:
+    # dataset specific
+    project_name: "sarm2-microagi"
+
+    task_name: "sarm2_partial2_cyc"
+    repo_id: microagi_sarm2_partial2      # ~/.cache/huggingface/lerobot/<repo_id> (MicroAGI task cycles, 316 shards snapshot of 2026-09-08 22:33 UTC)
+    state_norm_path: /home/yangcyself/workspace/vla_ws/sarm_datasets/microagi_sarm2_partial2/meta/state_norm.json
+
+    camera_names: [observation.images.front]
+    split_by: cycle_holdout   # S5: hold out the last cycle (highest cycle_index) of every recording with >= 3 cycles; task and scene are seen in training
+    video_backend: torchcodec  # torchcodec 0.8 (scripts/fix_torchcodec_ffmpeg.sh); pyav also works but is ~3x slower
+    seed: 42
+    device: "cuda"
+
+  dataloader:
+    batch_size: 64
+    num_workers: 16   # S5: extraction (~30 GB anon) runs alongside; 16 workers keep the pod under ~45 GB anon
+    prefetch_factor: 1
+    shuffle: True
+    pin_memory: True
+    persistent_workers: False
+    timeout: 600         # s; a torchcodec decode deadlocked one worker once (S3 sarm2 run, ~150k items in): fail fast instead of stalling forever
+
+  val_dataloader:
+    batch_size: 32
+    num_workers: 4
+    shuffle: False
+    pin_memory: True
+    persistent_workers: False
+
+  encoders:
+    vision_ckpt: "google/siglip2-base-patch16-224"  # SigLIP
+
+
+  model:
+    act_pri:
+      n_layers: 4
+      d_model: 512          
+      n_heads: 8
+      dropout: 0.1
+      state_dim: 12
+    use_future_step: True
+    d_model: 512          
+    n_layers: 6
+    n_heads: 8
+    dropout: 0.1
+    n_obs_steps: 6
+    max_rewind_steps: 3
+    frame_gap: 30
+    frame_size: 224      # loader resizes decoded frames to 224x224 in the workers (SigLIP input size); null = native
+    state_dim: 12
+    pre_decode_video_frames: False
+    no_state: False
+    resume_training: False
+    model_path: ""
+    act_pri_model_path: /home/yangcyself/workspace/vla_ws/opensarm/outputs/sarm2-microagi/actpri_partial2/2026-09-08_23-05-11/checkpoints/act_pri_final.pt  # act_pri_microagi_partial2 run (8000 steps)
+    finetune_act_pri: False  # S5: act_pri frozen (R24 candidate a); the gate/lang input then comes from the pretrained act_pri argmax
+    act_pri_loss_weight: 0.25  # weight for action prediction loss in the total loss (reward + action prediction)
+    no_pertube: True
+    moe:
+      num_experts: 10
+      top_k: 2
+      gate_units: [256]
+      gate_dropout: 0.1    
+      gate_act: "gelu"    
+      expert_units: [256, 256, 256]
+      expert_dropout: 0.1 
+      expert_act: "gelu"
+      # hyperparam for auxiliary loss terms
+      lambda_balance: 2.5   
+      lambda_entropy: 0.5
+      lambda_importance: 0.1
+      # hyperparam for balancing regression and auxiliary losses
+      alpha_auxiliary: 0.2
+
+    ## MicroAGI primitives (meta/act_pri_list.json): 17 verbs >= 5 h + dummy
+    num_tasks: 18
+    task_list: [
+      "place",
+      "pick_grab",
+      "fold_flatten",
+      "tie",
+      "insert",
+      "apply",
+      "close",
+      "arrange",
+      "wrap",
+      "remove",
+      "erase",
+      "cut",
+      "install",
+      "sew",
+      "open",
+      "scoop",
+      "pour_dump",
+      "dummy"
+      ]
+    
+    
+    task_inst_list: null   # null -> the loader reads the whole-task instruction from meta/tasks.jsonl
+
+    num_class: 8
+    class_list: [
+      "pick_grab or scoop",
+      "place or pour_dump",
+      "erase or apply or arrange",
+      "install or insert or close",
+      "fold_flatten or sew",
+      "tie or wrap",
+      "cut or remove or open",
+      "dummy"
+      ]
+    
+    
+   
+
+  optim:
+    lr: 5e-5
+    weight_decay: 5.0e-3
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    warmup_steps: 200
+    total_steps: 6000
+
+  train:
+    num_epochs: 1 # 80k steps/1 epoch
+    num_steps: 6000
+    grad_clip: 1.0
+    log_every: 20        # steps
+    eval_every: 1        # epochs
+    save_every: 1000     # steps
+    val_portion: 0.1     # fraction of episodes for validation
+    max_val_batches: 200  # cap the end-of-training validation (null = full val set)
+
+  eval:
+    run_times: 100  # number of episodes to evaluate in video
+    split_task: True
+    raw_data_run_times: 36
+    eval_whole_task_from_act_pri: False
+    eval_frame_gap: 30
+
+    ckpt_path_act_pri: /PATH/TO/ACT_PRI_CHECKPOINT.PT  # trained act_pri checkpoint to evaluate
+    ckpt_path_reward: /PATH/TO/REWARD_CHECKPOINT.PT    # trained reward-model checkpoint to evaluate
+
+    raw_data_dir: /PATH/TO/RAW_DATA_DIR  # directory of raw episode_* trajectories
+
+    

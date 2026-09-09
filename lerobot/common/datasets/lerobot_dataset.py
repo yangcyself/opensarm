@@ -138,9 +138,25 @@ class LeRobotDatasetMetadata:
         return Path(fpath)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
-        ep_chunk = self.get_episode_chunk(ep_index)
-        fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
+        # Episodes cut out of a longer recording can share that recording's mp4:
+        # `episodes.jsonl` may carry `video_episode_index` (whose mp4 to open) and
+        # `video_offset_s` (where this episode's timestamp 0 sits in that mp4).
+        src_index = self.get_video_source_index(ep_index)
+        ep_chunk = self.get_episode_chunk(src_index)
+        fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=src_index)
         return Path(fpath)
+
+    def get_video_source_index(self, ep_index: int) -> int:
+        episode = self.episodes.get(ep_index) if isinstance(self.episodes, dict) else None
+        if episode is None:
+            return ep_index
+        return int(episode.get("video_episode_index", ep_index))
+
+    def get_video_offset_s(self, ep_index: int) -> float:
+        episode = self.episodes.get(ep_index) if isinstance(self.episodes, dict) else None
+        if episode is None:
+            return 0.0
+        return float(episode.get("video_offset_s", 0.0))
 
     def get_episode_chunk(self, ep_index: int) -> int:
         return ep_index // self.chunks_size
@@ -706,8 +722,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         the main process and a subprocess fails to access it.
         """
         item = {}
+        offset_s = self.meta.get_video_offset_s(ep_idx)
         for vid_key, query_ts in query_timestamps.items():
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            if offset_s:
+                query_ts = [float(ts) + offset_s for ts in query_ts]
             frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
             item[vid_key] = frames.squeeze(0)
 

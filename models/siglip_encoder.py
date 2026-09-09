@@ -29,7 +29,7 @@ class FrozenSiglipEncoder(nn.Module):
         with torch.no_grad():
             # SigLIP uses get_text_features just like CLIP
             text_embeds = self.model.get_text_features(**inputs)
-        return text_embeds
+        return self._pooled(text_embeds)
 
     def encode_image(self, images: List[Image.Image]) -> torch.Tensor:
         """
@@ -42,4 +42,12 @@ class FrozenSiglipEncoder(nn.Module):
                                         ).to(self.device)
         with torch.no_grad():
             image_embeds = self.model.get_image_features(**inputs)
-        return image_embeds
+        return self._pooled(image_embeds)
+
+    @staticmethod
+    def _pooled(out) -> torch.Tensor:
+        # transformers < 4.5x returned the pooled tensor directly; newer versions return a
+        # BaseModelOutputWithPooling whose `pooler_output` is that same tensor.
+        if isinstance(out, torch.Tensor):
+            return out
+        return out.pooler_output

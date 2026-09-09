@@ -75,8 +75,15 @@ def decode_video_frames_torchvision(
     tolerance_s: float,
     backend: str = "pyav",
     log_loaded_timestamps: bool = False,
+    cluster_gap_s: float = 2.0,
 ) -> torch.Tensor:
     """Loads frames associated to the requested timestamps of a video
+
+    Queries are sorted and grouped into clusters of timestamps closer than `cluster_gap_s`;
+    each cluster gets its own seek to the preceding keyframe and is decoded only up to its
+    last timestamp, so the decode cost is bounded by (#clusters x GOP length + query span)
+    instead of the span between the first and the last query. Only the best candidate frame
+    per query is kept in memory.
 
     The backend can be either "pyav" (default) or "video_reader".
     "video_reader" requires installing torchvision from source, see:
@@ -107,27 +114,46 @@ def decode_video_frames_torchvision(
     # TODO(rcadene): also load audio stream at the same time
     reader = torchvision.io.VideoReader(video_path, "video")
 
-    # set the first and last requested timestamps
-    # Note: previous timestamps are usually loaded, since we need to access the previous key frame
-    first_ts = min(timestamps)
-    last_ts = max(timestamps)
+    # Sort the queries and group those closer than `cluster_gap_s` seconds. The previous
+    # implementation seeked once before min(timestamps) and decoded every frame up to
+    # max(timestamps); the SARM loaders always query the episode start frame together with
+    # a window near the sample, so decode time and RAM grew with the position in the episode
+    # (measured: 23 s and 10 GB for one item 500 s into an episode).
+    timestamps = [float(ts) for ts in timestamps]
+    order = sorted(range(len(timestamps)), key=lambda i: timestamps[i])
+    groups: list[list[int]] = []
+    for i in order:
+        if groups and timestamps[i] - timestamps[groups[-1][-1]] <= cluster_gap_s:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
 
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
+    # keep only the best candidate frame per query
+    best_frames: list[torch.Tensor | None] = [None] * len(timestamps)
+    best_dist = [float("inf")] * len(timestamps)
+    best_ts = [float("nan")] * len(timestamps)
+    for group in groups:
+        first_ts = timestamps[group[0]]
+        last_ts = timestamps[group[-1]]
 
-    # load all frames until last requested frame
-    loaded_frames = []
-    loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
+        # access closest key frame of the first requested frame of this group
+        # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
+        # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
+        reader.seek(first_ts, keyframes_only=keyframes_only)
+
+        # decode from that key frame until the last requested frame of this group
+        for frame in reader:
+            current_ts = frame["pts"]
+            if log_loaded_timestamps:
+                logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+            for i in group:
+                d = abs(current_ts - timestamps[i])
+                if d < best_dist[i]:
+                    best_dist[i] = d
+                    best_ts[i] = current_ts
+                    best_frames[i] = frame["data"]
+            if current_ts >= last_ts:
+                break
 
     if backend == "pyav":
         reader.container.close()
@@ -135,11 +161,8 @@ def decode_video_frames_torchvision(
     reader = None
 
     query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
-
-    # compute distances between each query timestamp and timestamps of all loaded frames
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
+    min_ = torch.tensor(best_dist)
+    closest_ts = torch.tensor(best_ts)
 
     is_within_tol = min_ < tolerance_s
     assert is_within_tol.all(), (
@@ -148,14 +171,13 @@ def decode_video_frames_torchvision(
         "This might be due to synchronization issues with timestamps during data collection."
         "To be safe, we advise to ignore this item during training."
         f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
+        f"\nclosest loaded timestamps: {closest_ts}"
         f"\nvideo: {video_path}"
         f"\nbackend: {backend}"
     )
 
-    # get closest frames to the query timestamps
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_ts = loaded_ts[argmin_]
+    # frames in query order
+    closest_frames = torch.stack(best_frames)
 
     if log_loaded_timestamps:
         logging.info(f"{closest_ts=}")

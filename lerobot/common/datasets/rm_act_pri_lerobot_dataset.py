@@ -31,6 +31,7 @@ class FrameGapLeRobotDataset(LeRobotDataset):
         task_list: list[str] | None = None,
         pre_decode_video_frames: bool = False,
         stage_model: bool = False,
+        frame_size: int | None = 224,
     ):
         super().__init__(
             repo_id=repo_id,
@@ -43,13 +44,19 @@ class FrameGapLeRobotDataset(LeRobotDataset):
             force_cache_sync=force_cache_sync,
             download_videos=download_videos,
             video_backend=video_backend,
-            pre_decode_video_frames=pre_decode_video_frames,
         )
+        # LeRobotDataset.__init__ has no `pre_decode_video_frames`; keep the flag
+        # (the workspaces pass it from cfg.model) without forwarding it.
+        self.pre_decode_video_frames = pre_decode_video_frames
 
         self.n_obs_steps = n_obs_steps
         self.frame_gap = frame_gap
         self.max_rewind_steps = max_rewind_steps
         self.timestamp_tensor = torch.tensor(self.hf_dataset["timestamp"]).flatten()
+        # Per-frame numeric columns as contiguous tensors. `hf_dataset.select(obs_indices)` costs
+        # O(dataset size) per call (0.06 s at 1.5 M rows, 0.4 s at 3.4 M rows, more than the video
+        # decode), so __getitem__ gathers rows from these tensors instead.
+        self._column_tensors = self._cache_frame_columns()
         assert all(img_name in self.meta.video_keys for img_name in image_names), f"Image names {image_names} not found in metadata video keys."
         self.wrapped_video_keys = image_names  # Use only the specified camera for videos
         self.verbs = ['move', 'grasp', 'rotate', 'push', 'pull', 'slide', 'lift', 'place']
@@ -59,6 +66,12 @@ class FrameGapLeRobotDataset(LeRobotDataset):
         self.no_pertube = no_pertube
         self.task_list = task_list
         self.stage_model = stage_model
+        # Resize decoded frames to (frame_size, frame_size) inside the worker so the
+        # DataLoader ships (T,3,224,224) instead of native-resolution float32 frames.
+        # SiglipImageProcessor (do_resize=True, size 224x224, resample=bilinear, no crop)
+        # would squash-resize to the same size anyway, so this is equivalent.
+        # None keeps the native resolution.
+        self.frame_size = frame_size
         if stage_model:
             self.total_obs_steps = self.n_obs_steps
         else:
@@ -149,39 +162,42 @@ class FrameGapLeRobotDataset(LeRobotDataset):
         
         # Compute frame indices for observation
         obs_indices = self.get_frame_indices(idx, self.n_obs_steps, self.frame_gap, ep_start, ep_end)
-        sequence = self.hf_dataset.select(obs_indices)
 
-        # Extract sequence data
+        # Extract sequence data (same values as hf_dataset.select(obs_indices)[key], see _cache_frame_columns)
         seq_item = {}
         act_pri_list = None  # datasets without act_pri annotation leave act_pri_index as zeros
-        for key in sequence.features:
-            value = sequence[key]
+        obs_index_tensor = torch.as_tensor(obs_indices, dtype=torch.long)
+        for key, column in self._column_tensors.items():
+            value = column[obs_index_tensor]
             if key == "actions":
-                seq_item[key] = torch.stack(value)
+                seq_item[key] = value
             elif key == "state":
-                seq_item[key] = torch.stack(value)
+                seq_item[key] = value
             elif key == "reward":
-                progress_list = torch.stack(value).squeeze(-1)
+                progress_list = value.squeeze(-1)
             elif key == "act_pri":
-                act_pri_list = torch.stack(value).squeeze(-1)
+                act_pri_list = value.squeeze(-1)
             else:
                 seq_item[key] = value[0]
             del value
-        del sequence
 
         # Query video frames
         obs_ts_range = self.timestamp_tensor[obs_indices].tolist()
         query_ts_dict = {key: obs_ts_range for key in self.wrapped_video_keys}
         
         video_query_issue_flag = False
+        fallback_size = self.frame_size or 224
         try:
             video_frames = self._query_videos(query_ts_dict, ep_idx)
+            if self.frame_size is not None:
+                for key in self.wrapped_video_keys:
+                    video_frames[key] = self._resize_frames(video_frames[key], self.frame_size)
         except Exception as e:
             print(f"[Warning] querying videos not enough frames: {e}, fall back to zero")
             video_query_issue_flag = True
             video_frames = {}
             for key in self.wrapped_video_keys:
-                video_frames[key] = torch.zeros((len(obs_ts_range), 3, 224, 224), dtype=torch.float32)
+                video_frames[key] = torch.zeros((len(obs_ts_range), 3, fallback_size, fallback_size), dtype=torch.float32)
         
         if not self.video_eval and self.max_rewind_steps > 0:
             rewind_flag = torch.rand(1).item() < 0.8 and idx > ep_start + required_history
@@ -223,8 +239,13 @@ class FrameGapLeRobotDataset(LeRobotDataset):
             phrase = [verb] + self.fake.words(nb=num_words)
             seq_item["task"] = " ".join(phrase)
         else:
-            task_index = min(seq_item["task_index"].item(), len(self.task_list) - 1)
-            seq_item["task"] = self.task_list[task_index]
+            if self.task_list is None:
+                # Multi-task datasets with hundreds of instructions: read the
+                # instruction from meta/tasks.jsonl instead of a config list.
+                seq_item["task"] = self.meta.tasks[seq_item["task_index"].item()]
+            else:
+                task_index = min(seq_item["task_index"].item(), len(self.task_list) - 1)
+                seq_item["task"] = self.task_list[task_index]
 
         # Progress targets
         seq_item["targets"] = torch.zeros(self.total_obs_steps + self.max_rewind_steps, dtype=torch.float32)
@@ -258,6 +279,48 @@ class FrameGapLeRobotDataset(LeRobotDataset):
         del item, video_frames, query_ts_dict, obs_ts_range, progress_list, act_pri_list, state_with_rewind, frame_relative_indices
 
         return seq_item
+
+    def _cache_frame_columns(self) -> dict[str, torch.Tensor]:
+        """All non-video columns of hf_dataset as tensors of shape (num_frames, ...).
+
+        Reads the arrow table directly (scalar columns -> 1-d, fixed-length list columns -> 2-d) so
+        the dtypes match what the torch-formatted hf_dataset returns row by row (float32 state /
+        actions / reward / timestamp, int64 indices). Falls back to the slow per-row path if
+        the dataset carries an indices mapping (never the case for LeRobot v2.1 episode selection).
+        """
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        if getattr(self.hf_dataset, "_indices", None) is not None:
+            return {key: torch.stack([torch.as_tensor(v) for v in self.hf_dataset[key]])
+                    for key in self.hf_dataset.features}
+        table = self.hf_dataset.data.table
+        columns = {}
+        for key in self.hf_dataset.features:
+            if key not in table.column_names:
+                continue
+            arr = table.column(key)
+            if pa.types.is_list(arr.type) or pa.types.is_fixed_size_list(arr.type) or pa.types.is_large_list(arr.type):
+                flat = pc.list_flatten(arr).to_numpy(zero_copy_only=False)
+                columns[key] = torch.from_numpy(np.ascontiguousarray(flat.reshape(len(arr), -1)))
+            elif pa.types.is_floating(arr.type) or pa.types.is_integer(arr.type) or pa.types.is_boolean(arr.type):
+                columns[key] = torch.from_numpy(np.ascontiguousarray(arr.to_numpy(zero_copy_only=False)))
+            if key in columns and columns[key].dtype == torch.float64:
+                columns[key] = columns[key].float()  # the torch-formatted hf_dataset returns float32 for float64 columns
+            # string / struct columns are not used by __getitem__
+        return columns
+
+    @staticmethod
+    def _resize_frames(frames: torch.Tensor, size: int) -> torch.Tensor:
+        """Bilinear + antialias squash-resize of (T,C,H,W) float frames to (T,C,size,size)."""
+        if frames.ndim == 3:
+            frames = frames.unsqueeze(0)
+        if frames.shape[-2:] == (size, size):
+            return frames
+        return torch.nn.functional.interpolate(
+            frames, size=(size, size), mode="bilinear", align_corners=False, antialias=True
+        )
 
     def _get_rewind(
         self, 

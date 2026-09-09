@@ -135,6 +135,201 @@ def get_valid_episodes(repo_id: str) -> List[int]:
 
     return sorted(valid_episodes)
 
+def split_train_eval_episodes_by_source(
+    valid_episodes: List[int],
+    repo_id: str,
+    train_ratio: float = 0.9,
+    seed: int = 42,
+    source_key: str = "source_uuid",
+) -> Tuple[List[int], List[int]]:
+    """Split episodes so that all episodes cut from the same recording land on one side.
+
+    Episodes derived from one long session share appearance, lighting and
+    objects; a per-episode split would leak them into validation. The source is
+    read from `meta/episodes.jsonl` (`source_key`), falling back to the episode
+    index itself when the field is absent.
+    """
+    eps_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id / "meta" / "episodes.jsonl"
+    source_of: Dict[int, str] = {}
+    with open(eps_path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            source_of[int(rec["episode_index"])] = str(rec.get(source_key, rec["episode_index"]))
+    sources = sorted({source_of.get(ep, str(ep)) for ep in valid_episodes})
+    random.seed(seed)
+    random.shuffle(sources)
+    n_train = int(len(sources) * train_ratio)
+    train_sources = set(sources[:n_train])
+    train_episodes = [ep for ep in valid_episodes if source_of.get(ep, str(ep)) in train_sources]
+    eval_episodes = [ep for ep in valid_episodes if source_of.get(ep, str(ep)) not in train_sources]
+    return train_episodes, eval_episodes
+
+
+def split_train_eval_episodes_cycle_holdout(
+    valid_episodes: List[int],
+    repo_id: str,
+    min_episodes: int = 3,
+    source_key: str = "source_uuid",
+    cycle_key: str = "cycle_index",
+    verbose: bool = True,
+) -> Tuple[List[int], List[int]]:
+    """Within-recording split: hold out the last task cycle of every recording.
+
+    For every `source_key` (recording) with at least `min_episodes` episodes, the
+    episode with the highest `cycle_key` goes to validation and all others train;
+    recordings with fewer episodes go entirely to train. Ties for the highest
+    cycle (e.g. the same cycle exported twice, or two group-task runs whose
+    cycle counters both end at the same value) are broken by the latest
+    `source_frame_start`; every episode that is an exact duplicate of the chosen
+    one (same `cycle_key` and `source_frame_start`) is held out too, so no copy
+    of a validation cycle can leak into training. Task and scene are therefore
+    seen in training; only the cycle is new (SARM2's own setting).
+    """
+    eps_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id / "meta" / "episodes.jsonl"
+    meta: Dict[int, Dict[str, Any]] = {}
+    with open(eps_path) as f:
+        for line in f:
+            if line.strip():
+                rec = json.loads(line)
+                meta[int(rec["episode_index"])] = rec
+    by_source: Dict[str, List[int]] = defaultdict(list)
+    for ep in valid_episodes:
+        rec = meta.get(ep, {})
+        by_source[str(rec.get(source_key, ep))].append(ep)
+
+    def rank(ep: int) -> Tuple[int, int]:
+        rec = meta.get(ep, {})
+        return int(rec.get(cycle_key, 0)), int(rec.get("source_frame_start", 0))
+
+    train_set: Set[int] = set()
+    eval_set: Set[int] = set()
+    n_small = n_held_sources = n_dup_holdout = 0
+    for src, eps in by_source.items():
+        if len(eps) < min_episodes:
+            train_set.update(eps)
+            n_small += 1
+            continue
+        top = max(eps, key=rank)
+        held = [e for e in eps if rank(e) == rank(top)]
+        n_dup_holdout += len(held) - 1
+        n_held_sources += 1
+        eval_set.update(held)
+        train_set.update(e for e in eps if e not in eval_set)
+    train_episodes = [ep for ep in valid_episodes if ep in train_set]
+    eval_episodes = [ep for ep in valid_episodes if ep in eval_set]
+    if verbose:
+        print(f"[Data] cycle_holdout: {len(by_source)} recordings; {n_held_sources} with >= {min_episodes} episodes "
+              f"contribute 1 held-out cycle each ({len(eval_episodes)} val episodes incl. {n_dup_holdout} duplicate copies); "
+              f"{n_small} recordings with < {min_episodes} episodes go entirely to train; "
+              f"{len(train_episodes)} train / {len(eval_episodes)} val episodes")
+    return train_episodes, eval_episodes
+
+
+def load_episode_meta(repo_id: str) -> Dict[int, Dict[str, Any]]:
+    """episode_index -> record of meta/episodes.jsonl for a dataset in the lerobot cache."""
+    eps_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id / "meta" / "episodes.jsonl"
+    meta: Dict[int, Dict[str, Any]] = {}
+    with open(eps_path) as f:
+        for line in f:
+            if line.strip():
+                rec = json.loads(line)
+                meta[int(rec["episode_index"])] = rec
+    return meta
+
+
+def cycle_identity(rec: Dict[str, Any], ep: int) -> Tuple[str, int, int]:
+    """Identity of a task cycle independent of the source root it was exported from.
+
+    `microagi_to_sarm.py` exports a recording once per dataset root it appears in (R26), so the
+    same cycle can occur as two episodes. (`source_uuid`, `cycle_index`) alone is not unique:
+    a recording with several group-task runs restarts the cycle counter per run, so the source
+    frame start is part of the key (`source_uuid`, `cycle_index`, `source_frame_start`).
+    """
+    return (str(rec.get("source_uuid", ep)), int(rec.get("cycle_index", 0)), int(rec.get("source_frame_start", 0)))
+
+
+def dedupe_episodes(valid_episodes: List[int], meta: Dict[int, Dict[str, Any]]) -> Tuple[List[int], Dict[int, int]]:
+    """Keep the lowest episode_index per cycle identity; returns (kept episodes, episode -> kept copy)."""
+    canonical: Dict[Tuple[str, int, int], int] = {}
+    copy_of: Dict[int, int] = {}
+    for ep in sorted(valid_episodes):
+        key = cycle_identity(meta.get(ep, {}), ep)
+        canonical.setdefault(key, ep)
+        copy_of[ep] = canonical[key]
+    kept = sorted(set(copy_of.values()))
+    return kept, copy_of
+
+
+def split_train_eval_episodes_cycle_holdout_random(
+    valid_episodes: List[int],
+    repo_id: str,
+    min_cycles: int = 3,
+    seed: int = 42,
+    source_key: str = "source_uuid",
+    verbose: bool = True,
+) -> Tuple[List[int], List[int]]:
+    """Within-recording split with a random *middle* cycle held out (S6, R29).
+
+    Episodes are first deduplicated by cycle identity (`dedupe_episodes`: one copy per
+    (`source_uuid`, `cycle_index`, `source_frame_start`), lowest episode_index kept; the other
+    copies are in neither split, so duplicated recordings count once). For every recording with
+    at least `min_cycles` distinct cycles, the cycles are ordered by `source_frame_start` (time in
+    the session) and one cycle that is neither the first nor the last is drawn with
+    `random.Random(seed)`; recordings with fewer cycles go entirely to train. Holding out the
+    *last* cycle (`cycle_holdout`) confounds cycle progress with session time (the scene fills up
+    over a session); a middle cycle is surrounded by training cycles on both sides.
+    """
+    meta = load_episode_meta(repo_id)
+    kept, copy_of = dedupe_episodes(valid_episodes, meta)
+    by_source: Dict[str, List[int]] = defaultdict(list)
+    for ep in kept:
+        by_source[str(meta.get(ep, {}).get(source_key, ep))].append(ep)
+    rng = random.Random(seed)
+    train_set: Set[int] = set()
+    eval_set: Set[int] = set()
+    n_small = 0
+    for src in sorted(by_source):  # sorted -> deterministic draw order
+        eps = sorted(by_source[src], key=lambda e: (int(meta[e].get("source_frame_start", 0)), e))
+        if len(eps) < min_cycles:
+            train_set.update(eps)
+            n_small += 1
+            continue
+        held = rng.choice(eps[1:-1])
+        eval_set.add(held)
+        train_set.update(e for e in eps if e != held)
+    train_episodes = [ep for ep in valid_episodes if ep in train_set]
+    eval_episodes = [ep for ep in valid_episodes if ep in eval_set]
+    if verbose:
+        print(f"[Data] cycle_holdout_random (seed {seed}): {len(valid_episodes)} episodes -> {len(kept)} distinct cycles "
+              f"({len(valid_episodes) - len(kept)} duplicate copies dropped); {len(by_source)} recordings, "
+              f"{len(eval_episodes)} with >= {min_cycles} cycles contribute 1 random middle cycle each, "
+              f"{n_small} recordings with fewer cycles go entirely to train; "
+              f"{len(train_episodes)} train / {len(eval_episodes)} val episodes")
+    return train_episodes, eval_episodes
+
+
+def split_episodes_by_mode(
+    valid_episodes: List[int],
+    repo_id: str,
+    mode: str = "episode",
+    train_ratio: float = 0.9,
+    seed: int = 42,
+) -> Tuple[List[int], List[int]]:
+    """Dispatch on `general.split_by`: 'episode' (random), 'source' (recording-level), 'cycle_holdout'
+    (last cycle of every recording, duplicates kept), 'cycle_holdout_random' (random middle cycle, deduplicated)."""
+    if mode == "source":
+        return split_train_eval_episodes_by_source(valid_episodes, repo_id, train_ratio, seed=seed)
+    if mode == "cycle_holdout":
+        return split_train_eval_episodes_cycle_holdout(valid_episodes, repo_id)
+    if mode == "cycle_holdout_random":
+        return split_train_eval_episodes_cycle_holdout_random(valid_episodes, repo_id, seed=seed)
+    if mode == "episode":
+        return split_train_eval_episodes(valid_episodes, train_ratio, seed=seed)
+    raise ValueError(f"unknown split_by mode {mode!r} (expected episode, source, cycle_holdout or cycle_holdout_random)")
+
+
 def split_train_eval_episodes(valid_episodes: List[int], train_ratio: float = 0.9, seed: int = 42) -> Tuple[List[int], List[int]]:
     """
     Randomly split valid episodes into training and evaluation sets.

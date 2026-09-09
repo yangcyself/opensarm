@@ -13,7 +13,7 @@ from tqdm import tqdm
 import wandb
 
 from lerobot.common.datasets.rm_act_pri_lerobot_dataset import FrameGapLeRobotDataset 
-from utils.data_utils import get_valid_episodes, split_train_eval_episodes, adapt_lerobot_batch_act_pri
+from utils.data_utils import get_valid_episodes, split_train_eval_episodes, split_train_eval_episodes_by_source, split_episodes_by_mode, adapt_lerobot_batch_act_pri
 from utils.train_utils import set_seed, save_ckpt, get_normalizer_from_calculated, plot_act_pri_result
 from utils.raw_data_utils import get_frame_num, get_frame_data_fast, get_traj_data
 from models.action_estimator import ActionTransformer
@@ -32,11 +32,21 @@ class ActPriWorkspace:
         print(f"[Init] Using device: {self.device}")
         set_seed(cfg.general.seed)
         self.camera_names = cfg.general.camera_names
-        self.save_dir = Path(f'{cfg.general.project_name}/{cfg.general.task_name}')
+        # Checkpoints go to <hydra run dir>/checkpoints (save_ckpt appends "checkpoints").
+        # The run dir already encodes <project>/<task>/<timestamp>, so do not nest them again.
+        self.save_dir = self._hydra_run_dir()
         self.task_list = OmegaConf.to_container(cfg.model.task_list, resolve=True)
         self.class_list = OmegaConf.to_container(cfg.model.class_list, resolve=True)
         self.class_task_dict = {}
         self._build_hierarchy()
+
+    @staticmethod
+    def _hydra_run_dir() -> Path:
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            return Path(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            return Path.cwd()
 
     def _build_hierarchy(self):
         # Temporary mapping to help build the tensor later
@@ -85,7 +95,10 @@ class ActPriWorkspace:
 
         # --- data ---
         valid_episodes = get_valid_episodes(cfg.general.repo_id)
-        train_eps, val_eps = split_train_eval_episodes(valid_episodes, 1 - cfg.train.val_portion, seed=cfg.general.seed)
+        train_eps, val_eps = split_episodes_by_mode(  # episode | source | cycle_holdout
+            valid_episodes, cfg.general.repo_id, cfg.general.get("split_by", "episode"),
+            1 - cfg.train.val_portion, seed=cfg.general.seed)
+        print(f"[Data] {len(train_eps)} train / {len(val_eps)} val episodes (split_by={cfg.general.get('split_by', 'episode')})")
 
         dataset_train = FrameGapLeRobotDataset(repo_id=cfg.general.repo_id, 
                                                episodes=train_eps, 
@@ -96,6 +109,8 @@ class ActPriWorkspace:
                                                no_pertube=cfg.model.no_pertube,
                                                task_list=cfg.model.task_list,
                                                pre_decode_video_frames=cfg.model.pre_decode_video_frames,
+                                               video_backend=cfg.general.get("video_backend", None),
+                                               frame_size=cfg.model.get("frame_size", 224),
                                                stage_model=True
                                                )
         
@@ -109,6 +124,8 @@ class ActPriWorkspace:
                                                no_pertube=cfg.model.no_pertube,
                                                task_list=cfg.model.task_list,
                                                pre_decode_video_frames=cfg.model.pre_decode_video_frames,
+                                               video_backend=cfg.general.get("video_backend", None),
+                                               frame_size=cfg.model.get("frame_size", 224),
                                                stage_model=True
                                                )
 
@@ -319,6 +336,8 @@ class ActPriWorkspace:
                             total_act_pri_loss += act_pri_loss.item()
                             num += 1
                             del batch
+                            if cfg.train.get("max_val_batches", None) and num >= cfg.train.max_val_batches:
+                                break
 
                 val_act_pri_loss = total_act_pri_loss / num
                 print(f"[Eval] Epoch {epoch} Val Act Pri Loss: {val_act_pri_loss:.6f}")
