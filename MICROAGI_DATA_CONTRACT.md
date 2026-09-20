@@ -59,9 +59,14 @@ fraction, and the reported progress is its complement.
 
 ## `act_pri` — the action primitive class per frame
 
-An integer index into `model.task_list` (17 verbs plus `dummy`). It supervises
-the estimator and, at reward-training time, selects the mixture-of-experts
-gate. It comes from the verb map over annotation text, not from any sensor.
+An integer index into `model.task_list` (17 verbs plus `dummy`), coming from
+the recipe's `primitives` file, not from any sensor. It supervises the
+estimator in act_pri training. At reward-training time the gate and the
+primitive text embedding come from the estimator's own prediction, not from
+this column: the column is used as the cross-entropy label only when
+`finetune_act_pri` is true (false in every campaign so far) and for a
+validation cross-entropy diagnostic. It does not select the mixture-of-experts
+gate.
 
 ## What the export carries but SARM2 never sees
 
