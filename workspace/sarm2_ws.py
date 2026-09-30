@@ -450,7 +450,9 @@ class SARM2Workspace:
                 if finetune_act_pri:
                     save_ckpt(act_pri_model, reward_optimizer, epoch, self.save_dir, input_name="act_pri_final")
 
-            if val_loss < best_val:
+            # "best" is judged only on epochs that ran the validation; with
+            # eval_every > 1 the other epochs have no val_loss at all.
+            if epoch % cfg.train.eval_every == 0 and val_loss < best_val:
                 best_val = val_loss
                 save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_best")
                 if finetune_act_pri:

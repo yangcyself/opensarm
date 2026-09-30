@@ -351,7 +351,9 @@ class ActPriWorkspace:
             if epoch == cfg.train.num_epochs:
                 save_ckpt(act_pri_model, act_pri_optimizer, epoch, self.save_dir, input_name="act_pri_final")
             
-            if val_act_pri_loss < best_val:
+            # "best" is judged only on epochs that ran the validation; with
+            # eval_every > 1 the other epochs have no val_act_pri_loss at all.
+            if epoch % cfg.train.eval_every == 0 and val_act_pri_loss < best_val:
                 best_val = val_act_pri_loss
                 save_ckpt(act_pri_model, act_pri_optimizer, epoch, self.save_dir, input_name="act_pri_best")
 
