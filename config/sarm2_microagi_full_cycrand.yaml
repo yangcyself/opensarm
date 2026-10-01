@@ -139,6 +139,7 @@ cfg:
     val_portion: 0.1     # fraction of episodes for validation
     resume_from: null    # a reward_latest.pt / reward_step_*.pt to continue from (weights, optimizer, step, schedule)
     wandb_resume_id: null  # the wandb run id to continue when resuming
+    wandb_inbox: null    # a directory another process drops {images, scalars} JSON messages into; the trainer logs them at its step
     max_val_batches: 200  # cap the end-of-training validation (null = full val set)
 
   eval:

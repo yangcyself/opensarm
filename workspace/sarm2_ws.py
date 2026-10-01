@@ -4,6 +4,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from datetime import datetime
 
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -288,6 +289,32 @@ class SARM2Workspace:
             print(f"[Init] Resumed from {resume_from}: epoch {ck['epoch']} done, step {step}, "
                   f"best val {best_val:.6f}, lr {reward_scheduler.get_last_lr()[0]:.3e}")
         resume_extra = lambda: {"step": step, "best_val": best_val}
+
+        # --- wandb inbox: figures and scalars produced by another process
+        # (the periodic test-set evaluation of saved checkpoints) are logged
+        # from here, by the only writer of this run, at the current step.
+        # A message is a JSON file {"images": {key: {"path", "caption"}},
+        # "scalars": {key: value}}; handled files move to inbox/done.
+        inbox = Path(cfg.train.wandb_inbox) if cfg.train.get("wandb_inbox", None) else None
+
+        def drain_inbox(at_step):
+            if inbox is None or not inbox.is_dir():
+                return
+            for f in sorted(inbox.glob("*.json")):
+                try:
+                    msg = json.loads(f.read_text())
+                except Exception:
+                    continue
+                payload = {k: wandb.Image(v["path"], caption=v.get("caption"))
+                           for k, v in msg.get("images", {}).items() if Path(v["path"]).is_file()}
+                payload.update(msg.get("scalars", {}))
+                if payload:
+                    wandb.log(payload, step=at_step)
+                    print(f"[inbox] logged {len(payload)} items from {f.name} at step {at_step}")
+                done = inbox / "done"
+                done.mkdir(exist_ok=True)
+                f.replace(done / f.name)
+
         for epoch in range(start_epoch, cfg.train.num_epochs + 1):
             reward_model.train()
             if finetune_act_pri:
@@ -374,6 +401,7 @@ class SARM2Workspace:
 
                     
                     if step % cfg.train.log_every == 0:
+                        drain_inbox(step)
                         log_dict = {
                             "train/total_loss": total_loss.item(),
                             "train/fit_loss": fit_loss.item(),
