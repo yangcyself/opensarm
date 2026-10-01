@@ -116,10 +116,13 @@ class SARM2Workspace:
         cfg = self.cfg
         OmegaConf.save(cfg, self.save_dir / "config.yaml")
         # --- wandb ---
+        # A resumed run continues its own wandb run (train.wandb_resume_id) so
+        # the curves stay in one place.
+        resume_id = cfg.train.get("wandb_resume_id", None)
         wandb.init(
             project=f'{cfg.general.project_name}',
             name=f'{cfg.general.task_name}/{datetime.now().strftime("%Y.%m.%d-%H.%M.%S")}/stepsToGo-{cfg.model.use_future_step}',
-            config=cfg,
+            config=cfg, id=resume_id or None, resume="allow" if resume_id else None,
         )
 
         # --- data ---
@@ -267,7 +270,25 @@ class SARM2Workspace:
         
         best_val = float("inf")
         step = 0
-        for epoch in range(1, cfg.train.num_epochs + 1):
+        start_epoch = 1
+        # --- resume a stopped run (train.resume_from): weights, optimizer, step
+        # counter, best validation loss, and the schedule fast-forwarded to the
+        # step. Training restarts at the epoch after the saved one; the rest of
+        # the interrupted epoch is not replayed.
+        resume_from = cfg.train.get("resume_from", None)
+        if resume_from:
+            ck = torch.load(resume_from, map_location=self.device)
+            reward_model.load_state_dict(ck["model"])
+            reward_optimizer.load_state_dict(ck["optimizer"])
+            start_epoch = int(ck["epoch"]) + 1
+            step = int(ck.get("step", ck["epoch"] * len(dataloader_train)))
+            best_val = float(ck.get("best_val", float("inf")))
+            for _ in range(step):
+                reward_scheduler.step()
+            print(f"[Init] Resumed from {resume_from}: epoch {ck['epoch']} done, step {step}, "
+                  f"best val {best_val:.6f}, lr {reward_scheduler.get_last_lr()[0]:.3e}")
+        resume_extra = lambda: {"step": step, "best_val": best_val}
+        for epoch in range(start_epoch, cfg.train.num_epochs + 1):
             reward_model.train()
             if finetune_act_pri:
                 act_pri_model.train()
@@ -369,7 +390,7 @@ class SARM2Workspace:
                     pbar.set_postfix(loss=f"{(total_loss.item()):.4f}")
 
                     if step % cfg.train.save_every == 0:
-                        save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name=f"reward_step_{step:06d}_loss_{reward_loss.item():.3f}")
+                        save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name=f"reward_step_{step:06d}_loss_{reward_loss.item():.3f}", extra=resume_extra())
                         if finetune_act_pri:
                             save_ckpt(act_pri_model, reward_optimizer, epoch, self.save_dir, input_name=f"act_pri_step_{step:06d}_loss_{act_pri_ce_loss.item():.3f}")
                     step += 1
@@ -441,12 +462,12 @@ class SARM2Workspace:
             torch.cuda.empty_cache()
 
             # --- save checkpoints ---
-            save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_latest")
+            save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_latest", extra=resume_extra())
             if finetune_act_pri:
                 save_ckpt(act_pri_model, reward_optimizer, epoch, self.save_dir, input_name="act_pri_latest")
 
             if epoch == cfg.train.num_epochs:
-                save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_final")
+                save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_final", extra=resume_extra())
                 if finetune_act_pri:
                     save_ckpt(act_pri_model, reward_optimizer, epoch, self.save_dir, input_name="act_pri_final")
 
@@ -454,7 +475,7 @@ class SARM2Workspace:
             # eval_every > 1 the other epochs have no val_loss at all.
             if epoch % cfg.train.eval_every == 0 and val_loss < best_val:
                 best_val = val_loss
-                save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_best")
+                save_ckpt(reward_model, reward_optimizer, epoch, self.save_dir, input_name="reward_best", extra=resume_extra())
                 if finetune_act_pri:
                     save_ckpt(act_pri_model, reward_optimizer, epoch, self.save_dir, input_name="act_pri_best")
 

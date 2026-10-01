@@ -10,17 +10,19 @@ import numpy as np
 
 def set_seed(s): random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
-def save_ckpt(model, opt, ep, save_dir, input_name=None):
+def save_ckpt(model, opt, ep, save_dir, input_name=None, extra=None):
+    """Model, optimizer and epoch, plus whatever `extra` carries (the step
+    counter and best validation loss, so a run can resume where it stopped)."""
     save_dir = Path(save_dir) / "checkpoints"  # convert to Path first
     name = f"{input_name}.pt" if input_name else f"epoch{ep:04d}.pt"
     p = save_dir / name
     p.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        dict(model=model.state_dict(),
-             optimizer=opt.state_dict(),
-             epoch=ep),
-        p
-    )
+    payload = dict(model=model.state_dict(), optimizer=opt.state_dict(), epoch=ep)
+    if extra:
+        payload.update(extra)
+    tmp = p.with_suffix(".pt.tmp")
+    torch.save(payload, tmp)
+    tmp.replace(p)  # never leave a half-written checkpoint under the final name
 
 @torch.no_grad()
 def get_normalizer_from_calculated(path, device) -> "SingleFieldLinearNormalizer":
